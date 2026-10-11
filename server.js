@@ -86,17 +86,69 @@ function parseArgs(argv) {
 
 const opts = parseArgs(process.argv);
 
-const ROOT = fs.realpathSync(process.cwd());
-{
-  const parsed = path.parse(ROOT);
+const CONFIG_PATH = path.join(os.homedir(), '.muse-ai-local-bridge', 'config.json');
+
+/**
+ * Explicit multi-root config. Returns [{name, path}] or null when absent.
+ * Every root gets the same guards as the cwd root (must exist, must not be
+ * a drive root or the home directory).
+ */
+function loadRoots() {
+  if (!fs.existsSync(CONFIG_PATH)) return null;
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+  catch { console.error(`warning: ${CONFIG_PATH} is not valid JSON, ignoring`); return null; }
+  const entries = cfg.roots;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    console.error(`warning: ${CONFIG_PATH} has no "roots" array, ignoring`);
+    return null;
+  }
   const home = fs.realpathSync(os.homedir());
-  if (ROOT === parsed.root || ROOT === home) {
+  const roots = [];
+  for (const e of entries) {
+    const p = typeof e === 'string' ? e : (e && e.path);
+    if (typeof p !== 'string') continue;
+    let real;
+    try { real = fs.realpathSync(p); }
+    catch { console.error(`warning: root not found, skipping: ${p}`); continue; }
+    const parsed = path.parse(real);
+    if (real === parsed.root || real === home) {
+      console.error(`warning: root too broad, skipping: ${p}`);
+      continue;
+    }
+    roots.push({ name: (typeof e === 'object' && e.name) || path.basename(real), path: real });
+  }
+  if (roots.length === 0) { console.error(`warning: no valid roots in ${CONFIG_PATH}, ignoring`); return null; }
+  return roots;
+}
+
+const CONFIG_ROOTS = loadRoots();
+let ROOTS;
+if (CONFIG_ROOTS) {
+  ROOTS = CONFIG_ROOTS; // explicit scope: cwd is irrelevant in config mode
+} else {
+  const cwd = fs.realpathSync(process.cwd());
+  const parsed = path.parse(cwd);
+  const home = fs.realpathSync(os.homedir());
+  if (cwd === parsed.root || cwd === home) {
     console.error(
       'Refusing to start: the working directory is a drive root or your home\n' +
       'directory, which is too broad a scope. cd into your project folder first.'
     );
     process.exit(2);
   }
+  ROOTS = [{ name: path.basename(cwd), path: cwd }];
+}
+const DEFAULT_ROOT = ROOTS[0];
+
+/** Pick the root for a call: args.project (name or path), else the default. */
+function selectRoot(args) {
+  const sel = args.project;
+  if (sel === undefined || sel === null || sel === '') return { root: DEFAULT_ROOT };
+  const s = String(sel).toLowerCase();
+  const found = ROOTS.find(r => r.name.toLowerCase() === s || r.path.toLowerCase() === s);
+  if (!found) return { error: 'BAD_ARGS', message: `unknown project: ${sel} (see list_projects)` };
+  return { root: found };
 }
 
 function loadToken(tokenFile) {
@@ -138,16 +190,16 @@ const fail = (res, status, code, message) => send(res, status, { ok: false, erro
 // Path rules (PROTOCOL.md section 5)
 // ---------------------------------------------------------------------------
 
-/** Resolve p inside ROOT (symlinks resolved). Returns {path} or {error}. */
-function resolveInRoot(p) {
-  const abs = path.resolve(ROOT, p || '.');
+/** Resolve p inside root (symlinks resolved). Returns {path} or {error}. */
+function resolveInRoot(p, root) {
+  const abs = path.resolve(root.path, p || '.');
   let real;
   try {
     real = fs.realpathSync(abs);
   } catch {
     return { error: 'PATH_NOT_FOUND', message: `no such file or directory: ${p}` };
   }
-  const rel = path.relative(ROOT, real);
+  const rel = path.relative(root.path, real);
   if (rel === '..' || rel.startsWith('..' + path.sep)) {
     return { error: 'PATH_OUTSIDE_ROOT', message: 'path is outside the allowed root' };
   }
@@ -155,8 +207,8 @@ function resolveInRoot(p) {
 }
 
 /** Permanent secret blocklist — enforced even inside the root. */
-function isBlocked(absPath) {
-  const rel = path.relative(ROOT, absPath);
+function isBlocked(absPath, root) {
+  const rel = path.relative(root.path, absPath);
   const parts = rel.split(path.sep);
   for (const part of parts) {
     if (part === '.ssh' || part === '.aws' || part === '.gnupg') return true;
@@ -189,22 +241,27 @@ function gitignoreToRegExp(pattern) {
   return { re: new RegExp(re), dirOnly };
 }
 
-function loadIgnoreRules() {
-  const rules = [{ re: /(^|\/)\.git(\/.*)?$/, dirOnly: false }]; // .git holds full history: noise for clients, never listed
-  const fp = path.join(ROOT, '.gitignore');
-  if (!fs.existsSync(fp)) return rules;
-  for (const line of fs.readFileSync(fp, 'utf8').split('\n')) {
-    if (line.trim().startsWith('!')) continue; // negations not supported in V1
-    const r = gitignoreToRegExp(line);
-    if (r) rules.push(r);
-  }
-  return rules;
-}
-const IGNORE_RULES = loadIgnoreRules();
+const ignoreCache = new Map(); // root.path -> rules (.gitignore is per root)
 
-function isIgnored(relPath, isDir) {
+function getIgnoreRules(root) {
+  if (!ignoreCache.has(root.path)) {
+    const rules = [{ re: /(^|\/)\.git(\/.*)?$/, dirOnly: false }]; // .git holds full history: noise for clients, never listed
+    const fp = path.join(root.path, '.gitignore');
+    if (fs.existsSync(fp)) {
+      for (const line of fs.readFileSync(fp, 'utf8').split('\n')) {
+        if (line.trim().startsWith('!')) continue; // negations not supported in V1
+        const r = gitignoreToRegExp(line);
+        if (r) rules.push(r);
+      }
+    }
+    ignoreCache.set(root.path, rules);
+  }
+  return ignoreCache.get(root.path);
+}
+
+function isIgnored(relPath, isDir, root) {
   const rel = relPath.split(path.sep).join('/');
-  return IGNORE_RULES.some(r => (!r.dirOnly || isDir) && r.re.test(rel));
+  return getIgnoreRules(root).some(r => (!r.dirOnly || isDir) && r.re.test(rel));
 }
 
 function isBinary(buf) {
@@ -216,13 +273,16 @@ function isBinary(buf) {
 // ---------------------------------------------------------------------------
 
 function tool_list_projects() {
-  return { projects: [{ name: path.basename(ROOT), path: ROOT, is_default: true }] };
+  return { projects: ROOTS.map(r => ({ name: r.name, path: r.path, is_default: r === DEFAULT_ROOT })) };
 }
 
 function tool_list_files(args) {
-  const r = resolveInRoot(args.path || '.');
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path || '.', root);
   if (r.error) return { error: r.error, message: r.message };
-  if (isBlocked(r.path)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  if (isBlocked(r.path, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
   let st;
   try { st = fs.statSync(r.path); } catch { return { error: 'PATH_NOT_FOUND', message: 'no such file or directory' }; }
   if (!st.isDirectory()) return { error: 'BAD_ARGS', message: 'path is not a directory' };
@@ -243,24 +303,27 @@ function tool_list_files(args) {
       if (out.length >= CAP) return;
       if (!includeHidden && e.name.startsWith('.')) continue;
       const abs = path.join(dir, e.name);
-      const rel = path.relative(ROOT, abs);
+      const rel = path.relative(root.path, abs);
       const isDir = e.isDirectory();
-      if (isIgnored(rel, isDir) || isBlocked(abs)) continue;
+      if (isIgnored(rel, isDir, root) || isBlocked(abs, root)) continue;
       out.push({ path: rel.split(path.sep).join('/'), type: isDir ? 'dir' : 'file' });
       if (recursive && isDir && depth < maxDepth) walk(abs, depth + 1);
     }
   }
   walk(r.path, 0);
-  return { path: path.relative(ROOT, r.path).split(path.sep).join('/') || '.', files: out, truncated: out.length >= CAP };
+  return { path: path.relative(root.path, r.path).split(path.sep).join('/') || '.', files: out, truncated: out.length >= CAP };
 }
 
 function tool_read_file(args) {
   if (!args.path || typeof args.path !== 'string') {
     return { error: 'BAD_ARGS', message: 'path is required' };
   }
-  const r = resolveInRoot(args.path);
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path, root);
   if (r.error) return { error: r.error, message: r.message };
-  if (isBlocked(r.path)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  if (isBlocked(r.path, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
   let st;
   try { st = fs.statSync(r.path); } catch { return { error: 'PATH_NOT_FOUND', message: 'no such file or directory' }; }
   if (st.isDirectory()) return { error: 'BAD_ARGS', message: 'path is a directory' };
@@ -273,7 +336,7 @@ function tool_read_file(args) {
   const limit = Math.min(Math.max(parseInt(args.limit ?? 200, 10) || 200, 1), 2000);
   const slice = lines.slice(offset, offset + limit);
   return {
-    path: path.relative(ROOT, r.path).split(path.sep).join('/'),
+    path: path.relative(root.path, r.path).split(path.sep).join('/'),
     total_lines: lines.length,
     offset,
     content: slice.join('\n'),
@@ -285,9 +348,12 @@ function tool_search_code(args) {
   if (!args.pattern || typeof args.pattern !== 'string') {
     return { error: 'BAD_ARGS', message: 'pattern is required' };
   }
-  const r = resolveInRoot(args.path || '.');
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path || '.', root);
   if (r.error) return { error: r.error, message: r.message };
-  if (isBlocked(r.path)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  if (isBlocked(r.path, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
 
   const pattern = args.pattern;
   const fileGlob = args.file_glob || null;
@@ -309,9 +375,9 @@ function tool_search_code(args) {
         continue;
       }
       const abs = path.join(dir, e.name);
-      const rel = path.relative(ROOT, abs);
+      const rel = path.relative(root.path, abs);
       const isDir = e.isDirectory();
-      if (isIgnored(rel, isDir) || isBlocked(abs)) continue;
+      if (isIgnored(rel, isDir, root) || isBlocked(abs, root)) continue;
       if (isDir) { walk(abs); continue; }
       if (globRe && !globRe.test(e.name)) continue;
       filesSeen++;
@@ -341,8 +407,8 @@ function tool_search_code(args) {
   if (startStat.isDirectory()) walk(r.path);
   else {
     // single file search
-    const rel = path.relative(ROOT, r.path);
-    if (!isIgnored(rel, false)) {
+    const rel = path.relative(root.path, r.path);
+    if (!isIgnored(rel, false, root)) {
       const lines = fs.readFileSync(r.path, 'utf8').split('\n');
       for (let i = 0; i < lines.length && matches.length < CAP_MATCHES; i++) {
         if (lines[i].includes(pattern)) matches.push({ path: rel.split(path.sep).join('/'), line: i + 1, context: lines[i] });
@@ -356,47 +422,56 @@ function tool_search_code(args) {
 // git helpers — spawned with argv arrays, never through a shell
 // ---------------------------------------------------------------------------
 
-function gitIsRepo() {
-  const r = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: ROOT, encoding: 'utf8', timeout: 10000 });
+function gitIsRepo(root) {
+  const r = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root.path, encoding: 'utf8', timeout: 10000 });
   return r.status === 0;
 }
 
-function gitRun(gitArgs, timeoutMs = 15000) {
-  const r = spawnSync('git', gitArgs, { cwd: ROOT, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+function gitRun(gitArgs, root, timeoutMs = 15000) {
+  const r = spawnSync('git', gitArgs, { cwd: root.path, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
   return r;
 }
 
-function tool_git_status() {
-  if (!gitIsRepo()) return { error: 'BAD_ARGS', message: 'not a git repository' };
-  const r = gitRun(['status', '--porcelain=v1', '--untracked-files=normal']);
+function tool_git_status(args) {
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  const r = gitRun(['status', '--porcelain=v1', '--untracked-files=normal'], root);
   if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: (r.stderr || 'git status failed').trim() };
   const files = r.stdout.split('\n').filter(Boolean).map(line => ({
     status: line.slice(0, 2).trim() || '?',
     path: line.slice(3).trim(),
   }));
-  const branch = gitRun(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const branch = gitRun(['rev-parse', '--abbrev-ref', 'HEAD'], root);
   return { branch: branch.status === 0 ? branch.stdout.trim() : null, files };
 }
 
 function tool_git_diff(args) {
-  if (!gitIsRepo()) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
   const gitArgs = ['diff', '--no-color'];
   if (args.staged) gitArgs.push('--cached');
   if (args.path) {
-    const r = resolveInRoot(args.path);
+    const r = resolveInRoot(args.path, root);
     if (r.error) return { error: r.error, message: r.message };
     gitArgs.push('--', r.path);
   }
-  const r = gitRun(gitArgs, 30000);
+  const r = gitRun(gitArgs, root, 30000);
   if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: (r.stderr || 'git diff failed').trim() };
   const MAX = 200000;
   return { diff: r.stdout.slice(0, MAX), truncated: r.stdout.length > MAX };
 }
 
 function tool_git_log(args) {
-  if (!gitIsRepo()) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
   const limit = Math.min(Math.max(parseInt(args.limit ?? 20, 10) || 20, 1), 100);
-  const r = gitRun(['log', `-n${limit}`, '--pretty=format:%H%x1f%an%x1f%ad%x1f%s', '--date=iso']);
+  const r = gitRun(['log', `-n${limit}`, '--pretty=format:%H%x1f%an%x1f%ad%x1f%s', '--date=iso'], root);
   if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: (r.stderr || 'git log failed').trim() };
   const commits = r.stdout.split('\n').filter(Boolean).map(line => {
     const [hash, author, date, subject] = line.split('\x1f');
@@ -441,20 +516,23 @@ function tool_write_file(args) {
   if (Buffer.byteLength(args.content, 'utf8') > MAX_WRITE_BYTES) {
     return { error: 'BAD_ARGS', message: `content too large (max ${MAX_WRITE_BYTES} bytes)` };
   }
-  const r = resolveInRoot(args.path);
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path, root);
   if (r.error && r.error !== 'PATH_NOT_FOUND') return { error: r.error, message: r.message };
   // resolveInRoot fails on missing paths; for writes, resolve the parent instead.
   let abs;
   if (r.error === 'PATH_NOT_FOUND') {
-    const parent = resolveInRoot(path.dirname(args.path) === '.' ? '.' : path.dirname(args.path));
+    const parent = resolveInRoot(path.dirname(args.path) === '.' ? '.' : path.dirname(args.path), root);
     if (parent.error) return { error: parent.error, message: parent.message };
     abs = path.join(parent.path, path.basename(args.path));
-    const rel = path.relative(ROOT, abs);
+    const rel = path.relative(root.path, abs);
     if (rel === '..' || rel.startsWith('..' + path.sep)) return { error: 'PATH_OUTSIDE_ROOT', message: 'path is outside the allowed root' };
   } else {
     abs = r.path;
   }
-  if (isBlocked(abs)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  if (isBlocked(abs, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
   try {
     if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
       return { error: 'BAD_ARGS', message: 'path is a directory' };
@@ -463,17 +541,21 @@ function tool_write_file(args) {
   } catch (e) {
     return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` };
   }
-  auditLog('write_file', path.relative(ROOT, abs).split(path.sep).join('/'), 'ok');
-  return { path: path.relative(ROOT, abs).split(path.sep).join('/'), bytes_written: Buffer.byteLength(args.content, 'utf8') };
+  const relPath = path.relative(root.path, abs).split(path.sep).join('/');
+  auditLog('write_file', relPath, 'ok');
+  return { path: relPath, bytes_written: Buffer.byteLength(args.content, 'utf8') };
 }
 
 function tool_edit_file(args) {
   for (const k of ['path', 'old_text', 'new_text']) {
     if (typeof args[k] !== 'string') return { error: 'BAD_ARGS', message: `${k} is required and must be a string` };
   }
-  const r = resolveInRoot(args.path);
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path, root);
   if (r.error) return { error: r.error, message: r.message };
-  if (isBlocked(r.path)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  if (isBlocked(r.path, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
   let content;
   try { content = fs.readFileSync(r.path, 'utf8'); }
   catch { return { error: 'PATH_NOT_FOUND', message: 'no such file or directory' }; }
@@ -489,17 +571,21 @@ function tool_edit_file(args) {
   }
   try { atomicWrite(r.path, next); }
   catch (e) { return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` }; }
-  auditLog('edit_file', path.relative(ROOT, r.path).split(path.sep).join('/'), 'ok');
-  return { path: path.relative(ROOT, r.path).split(path.sep).join('/'), bytes_written: Buffer.byteLength(next, 'utf8') };
+  const relPath = path.relative(root.path, r.path).split(path.sep).join('/');
+  auditLog('edit_file', relPath, 'ok');
+  return { path: relPath, bytes_written: Buffer.byteLength(next, 'utf8') };
 }
 
 function tool_apply_patch(args) {
   if (typeof args.path !== 'string' || typeof args.patch !== 'string') {
     return { error: 'BAD_ARGS', message: 'path and patch are required strings' };
   }
-  const r = resolveInRoot(args.path);
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path, root);
   if (r.error) return { error: r.error, message: r.message };
-  if (isBlocked(r.path)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  if (isBlocked(r.path, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
   let lines;
   try { lines = fs.readFileSync(r.path, 'utf8').split('\n'); }
   catch { return { error: 'PATH_NOT_FOUND', message: 'no such file or directory' }; }
@@ -565,8 +651,9 @@ function tool_apply_patch(args) {
   }
   try { atomicWrite(r.path, next); }
   catch (e) { return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` }; }
-  auditLog('apply_patch', path.relative(ROOT, r.path).split(path.sep).join('/'), `${hunks.length} hunks ok`);
-  return { path: path.relative(ROOT, r.path).split(path.sep).join('/'), hunks_applied: hunks.length };
+  const relPath = path.relative(root.path, r.path).split(path.sep).join('/');
+  auditLog('apply_patch', relPath, `${hunks.length} hunks ok`);
+  return { path: relPath, hunks_applied: hunks.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +681,9 @@ function tool_run_command(args) {
   if (!args.command || typeof args.command !== 'string') {
     return { error: 'BAD_ARGS', message: 'command is required' };
   }
+  const sel = selectRoot(args);
+  if (sel.error) return sel;
+  const root = sel.root;
   const cmd = args.command.trim();
   if (METACHAR.test(cmd)) {
     auditLog('run_command', cmd.slice(0, 80), 'rejected: metacharacter');
@@ -610,7 +700,7 @@ function tool_run_command(args) {
   const timeoutMs = Math.min(Math.max((parseInt(args.timeout_s ?? 600, 10) || 600), 1), 1800) * 1000;
   let r;
   try {
-    r = spawnSync(argv[0], argv.slice(1), { cwd: ROOT, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+    r = spawnSync(argv[0], argv.slice(1), { cwd: root.path, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
   } catch (e) {
     auditLog('run_command', cmd, `error: ${e.message}`);
     return { error: 'INTERNAL_ERROR', message: `command failed to spawn: ${e.message}` };
@@ -687,7 +777,7 @@ const ALL_TOOLS = opts.readOnly ? READ_TOOLS : { ...READ_TOOLS, ...WRITE_TOOLS }
 function serveToolsList(res) {
   ok(res, {
     mode: opts.readOnly ? 'baca' : 'kerja',
-    project_roots: [ROOT],
+    project_roots: ROOTS.map(r => r.path),
     tools: Object.entries(ALL_TOOLS).map(([name, t]) => ({
       name,
       description: t.description,
@@ -778,7 +868,7 @@ server.listen(opts.port, '127.0.0.1', () => {
   const port = typeof addr === 'object' ? addr.port : opts.port;
   console.log('');
   console.log('muse-ai-local-bridge server running (V1)');
-  console.log(`  root : ${ROOT}`);
+  console.log(`  roots: ${ROOTS.map(r => r.path).join(', ')}`);
   console.log(`  mode : ${opts.readOnly ? 'baca (read-only)' : 'kerja (read + write + commands)'}`);
   console.log(`  local: http://127.0.0.1:${port}`);
   console.log('');
