@@ -41,7 +41,8 @@ Usage: server.js [options]
   --allow "cmd"     add a command pattern to the run_command allowlist
                     (repeatable; exact match, no shell metacharacters)
   --token-file p    persist the API token in file p (mode 0600) instead of
-                    generating a fresh one on every start
+                    the default ~/.muse-ai-local-bridge/token
+  --new-token       generate a fresh token, replacing the saved one
   -h, --help        this text
 
 The working directory where this command runs becomes the single access
@@ -50,7 +51,7 @@ Listens on 127.0.0.1 only — publish it with your own tunnel.`);
 }
 
 function parseArgs(argv) {
-  const opts = { port: 8787, readOnly: false, allow: [], tokenFile: null };
+  const opts = { port: 8787, readOnly: false, allow: [], tokenFile: null, newToken: false };
   const args = argv.slice(2);
   const needValue = (i, flag) => {
     if (i >= args.length) { console.error(`error: ${flag} needs a value`); process.exit(2); }
@@ -70,6 +71,8 @@ function parseArgs(argv) {
       opts.allow.push(needValue(++i, a));
     } else if (a === '--token-file') {
       opts.tokenFile = needValue(++i, a);
+    } else if (a === '--new-token') {
+      opts.newToken = true;
     } else if (a === '-h' || a === '--help') {
       printHelp();
       process.exit(0);
@@ -274,19 +277,20 @@ function selectRoot(args) {
   return { root: found };
 }
 
-function loadToken(tokenFile) {
-  if (!tokenFile) return crypto.randomBytes(32).toString('hex'); // 256-bit
-  const p = path.resolve(tokenFile);
-  if (fs.existsSync(p)) {
+function loadToken(tokenFile, forceNew) {
+  // Default: a stable token saved under ~/.muse-ai-local-bridge/token, so a
+  // layman user never has to think about it — restart keeps working.
+  const p = path.resolve(tokenFile || path.join(os.homedir(), '.muse-ai-local-bridge', 'token'));
+  if (!forceNew && fs.existsSync(p)) {
     const t = fs.readFileSync(p, 'utf8').trim();
-    if (t) return t;
+    if (t) return { token: t, fresh: false, path: p };
   }
-  const t = crypto.randomBytes(32).toString('hex');
+  const t = crypto.randomBytes(32).toString('hex'); // 256-bit
   fs.mkdirSync(path.dirname(p), { recursive: true });
   fs.writeFileSync(p, t + '\n', { mode: 0o600 });
-  return t;
+  return { token: t, fresh: true, path: p };
 }
-const TOKEN = loadToken(opts.tokenFile);
+const { token: TOKEN, fresh: TOKEN_FRESH, path: TOKEN_PATH } = loadToken(opts.tokenFile, opts.newToken);
 const TOKEN_BUF = Buffer.from(TOKEN, 'utf8');
 
 function tokenMatches(provided) {
@@ -913,6 +917,11 @@ function serveToolsList(res) {
   ok(res, {
     mode: opts.readOnly ? 'read-only' : 'read-write',
     project_roots: getRoots().map(r => r.path),
+    // How to call a tool — shown here because this is the response every
+    // client reads before calling anything. Do NOT invent other URL shapes.
+    call: 'GET /api/tools/call?tool=<name>&<param>=<value>...',
+    call_example: 'GET /api/tools/call?tool=read_file&path=package.json',
+    auth: 'X-Api-Key: <token> header (Authorization: Bearer <token> also accepted)',
     tools: Object.entries(ALL_TOOLS).map(([name, t]) => ({
       name,
       description: t.description,
@@ -998,17 +1007,46 @@ function serveSkill(res) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP server — localhost only, GET only, token on every request
+// HTTP server — localhost only, GET + POST, token on every request
 // ---------------------------------------------------------------------------
 
-const server = http.createServer((req, res) => {
+/** Read a JSON body (for POST tool calls). Returns {} on empty/invalid. */
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; if (raw.length > 2 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => {
+      if (!raw) return resolve({});
+      try { resolve(JSON.parse(raw)); } catch { resolve({}); }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+const server = http.createServer(async (req, res) => {
   let url;
   try {
     url = new URL(req.url, 'http://localhost');
   } catch {
     return fail(res, 400, 'BAD_ARGS', 'malformed URL');
   }
-  if (req.method !== 'GET') return fail(res, 405, 'METHOD_NOT_ALLOWED', 'only GET is supported');
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return fail(res, 405, 'METHOD_NOT_ALLOWED', 'only GET and POST are supported');
+  }
+  // POST: tool name + args come from the JSON body. Merge into the URL query
+  // so the rest of the pipeline (auth, handleCall) works unchanged.
+  if (req.method === 'POST') {
+    const body = await readJsonBody(req);
+    if (typeof body === 'object' && body !== null) {
+      for (const [k, v] of Object.entries(body)) {
+        if (k === 'args' && typeof v === 'object' && v !== null) {
+          url.searchParams.set('args', JSON.stringify(v));
+        } else if (typeof v !== 'object') {
+          url.searchParams.set(k, String(v));
+        }
+      }
+    }
+  }
   // Public bootstrap: an assistant that has never seen a bridge must learn
   // how to connect from the URL alone — no token, no explaining. These two
   // routes carry no secrets; everything else stays behind the token.
@@ -1019,6 +1057,10 @@ const server = http.createServer((req, res) => {
       '1. Read /skill.md (no token needed).\n' +
       '2. Ask the owner for the token via secure input — never as chat text.\n' +
       '3. Send it as the X-Api-Key header on /api/tools/*.\n\n' +
+      'To call a tool, GET (do not invent other URL shapes):\n' +
+      '  /api/tools/call?tool=<name>&<param>=<value>...\n' +
+      'Example:\n' +
+      '  /api/tools/call?tool=read_file&path=package.json\n\n' +
       'Humans: https://github.com/tegarp00/muse-ai-local-bridge\n',
       'text/plain; charset=utf-8');
   }
@@ -1053,8 +1095,11 @@ server.listen(opts.port, '127.0.0.1', () => {
   console.log(`  mode : ${opts.readOnly ? 'read-only' : 'read-write (read + write + commands)'}`);
   console.log(`  local: http://127.0.0.1:${port}`);
   console.log('');
-  console.log('  TOKEN (shown once — keep it secret, never paste into chat):');
+  console.log('  TOKEN (keep it secret, never paste into chat):');
   console.log(`  ${TOKEN}`);
+  console.log(TOKEN_FRESH
+    ? `  (saved to ${TOKEN_PATH} — reused on next start; use --new-token to rotate)`
+    : `  (reused from ${TOKEN_PATH} — use --new-token to rotate)`);
   console.log('');
   console.log('  Next steps:');
   console.log(`  1. Publish localhost with your tunnel, e.g.: cloudflared tunnel --url http://127.0.0.1:${port}`);
