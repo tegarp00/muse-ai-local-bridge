@@ -12,10 +12,14 @@ Zero runtime dependencies. One file you can audit in ten minutes.
 ## Quick start
 
 1. **Install Node.js 18+.** Nothing else.
-2. **Run the server inside your project folder:**
+2. **Install the bridge** (or run it once with `npx muse-ai-local-bridge`):
+   ```sh
+   npm install -g muse-ai-local-bridge
+   ```
+3. **Run the server inside your project folder:**
    ```sh
    cd ~/projects/my-project
-   npx github:tegarp00/muse-ai-local-bridge
+   mbridge
    ```
    It prints a one-time token. Keep that terminal open.
 3. **Expose it** with a tunnel you control. Any tunnel works — cloudflared,
@@ -37,7 +41,7 @@ Zero runtime dependencies. One file you can audit in ten minutes.
 ## CLI
 
 ```sh
-npx github:tegarp00/muse-ai-local-bridge [options]
+npx muse-ai-local-bridge [options]
 
   --port <n>       listen port (default 8787)
   --read-only      read-only mode: read + git tools only, no writes or commands
@@ -90,7 +94,7 @@ mbridge remove my-project           # remove by name or path
 mbridge list                        # show registered projects
 ```
 
-(With npx: `npx github:tegarp00/muse-ai-local-bridge add ~/projects/my-project`.)
+(With npx: `npx muse-ai-local-bridge add ~/projects/my-project`.)
 
 ## Revoking access
 

@@ -110,6 +110,19 @@ GET /api/tools/call?tool=read_file&args=%7B%22path%22%3A%22README.md%22%7D
 X-Api-Key: <token>
 ```
 
+**Flat query parameters (compatibility).** Some client frameworks flatten
+arguments into individual query parameters instead of the `args` JSON object:
+
+```
+GET /api/tools/call?tool=read_file&path=README.md&limit=50
+```
+
+The server merges these into `args`. String values are coerced to the scalar
+type tools expect (`"true"`/`"false"` → boolean, numeric strings → number,
+`"null"` → null). On a key conflict, the `args` JSON object wins. The `args`
+JSON remains canonical — prefer it when you need precise types or nested
+values.
+
 ## 4. Envelopes
 
 Success:

@@ -161,7 +161,19 @@ function cmdRemove(target) {
 
 function cmdList() {
   const cfg = readConfigFile();
-  if (cfg.roots.length === 0) { console.log('no projects registered.'); return; }
+  if (cfg.roots.length === 0) {
+    // No config file: the server serves its start folder. Show what that is here.
+    const cwd = fs.realpathSync(process.cwd());
+    const parsed = path.parse(cwd);
+    const home = fs.realpathSync(os.homedir());
+    console.log(`* ${path.basename(cwd)}  ${cwd}`);
+    if (cwd === parsed.root || cwd === home) {
+      console.log('\nNote: this folder is too broad — the server would refuse to start here.');
+    } else {
+      console.log('\n* = current folder (no config file: the server serves its start folder)');
+    }
+    return;
+  }
   cfg.roots.forEach((e, i) => {
     const ep = typeof e === 'string' ? e : e.path;
     const nm = (typeof e === 'object' && e.name) || path.basename(ep);
@@ -439,7 +451,7 @@ function tool_list_files(args) {
 
 function tool_read_file(args) {
   if (!args.path || typeof args.path !== 'string') {
-    return { error: 'BAD_ARGS', message: 'path is required' };
+    return { error: 'BAD_ARGS', message: 'path is required (e.g. ?tool=read_file&path=README.md)' };
   }
   const sel = selectRoot(args);
   if (sel.error) return sel;
@@ -469,7 +481,7 @@ function tool_read_file(args) {
 
 function tool_search_code(args) {
   if (!args.pattern || typeof args.pattern !== 'string') {
-    return { error: 'BAD_ARGS', message: 'pattern is required' };
+    return { error: 'BAD_ARGS', message: 'pattern is required (e.g. ?tool=search_code&pattern=TODO)' };
   }
   const sel = selectRoot(args);
   if (sel.error) return sel;
@@ -634,7 +646,7 @@ function atomicWrite(absPath, content) {
 const MAX_WRITE_BYTES = 1024 * 1024; // 1 MB
 
 function tool_write_file(args) {
-  if (!args.path || typeof args.path !== 'string') return { error: 'BAD_ARGS', message: 'path is required' };
+  if (!args.path || typeof args.path !== 'string') return { error: 'BAD_ARGS', message: 'path is required (e.g. ?tool=write_file&path=notes.txt&content=...)' };
   if (typeof args.content !== 'string') return { error: 'BAD_ARGS', message: 'content must be a string' };
   if (Buffer.byteLength(args.content, 'utf8') > MAX_WRITE_BYTES) {
     return { error: 'BAD_ARGS', message: `content too large (max ${MAX_WRITE_BYTES} bytes)` };
@@ -671,7 +683,7 @@ function tool_write_file(args) {
 
 function tool_edit_file(args) {
   for (const k of ['path', 'old_text', 'new_text']) {
-    if (typeof args[k] !== 'string') return { error: 'BAD_ARGS', message: `${k} is required and must be a string` };
+    if (typeof args[k] !== 'string') return { error: 'BAD_ARGS', message: `${k} is required and must be a string (e.g. ?tool=edit_file&path=f.txt&old_text=..&new_text=..)` };
   }
   const sel = selectRoot(args);
   if (sel.error) return sel;
@@ -802,7 +814,7 @@ validateAllowlist(ALLOWLIST);
 
 function tool_run_command(args) {
   if (!args.command || typeof args.command !== 'string') {
-    return { error: 'BAD_ARGS', message: 'command is required' };
+    return { error: 'BAD_ARGS', message: 'command is required (e.g. ?tool=run_command&command=npm%20test)' };
   }
   const sel = selectRoot(args);
   if (sel.error) return sel;
@@ -909,6 +921,15 @@ function serveToolsList(res) {
   });
 }
 
+/** Query params arrive as strings; restore the scalar types tools expect. */
+function coerceFlatValue(v) {
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  if (v === 'null') return null;
+  if (v !== '' && !Number.isNaN(Number(v))) return Number(v);
+  return v;
+}
+
 function handleCall(url, res) {
   const name = url.searchParams.get('tool');
   const rawArgs = url.searchParams.get('args') || '{}';
@@ -917,7 +938,7 @@ function handleCall(url, res) {
   if (!tool) {
     const known = Object.keys(READ_TOOLS).includes(name);
     return fail(res, 404, known ? 'MODE_READ_ONLY' : 'UNKNOWN_TOOL',
-      known ? `tool "${name}" is not available in read-only mode` : `unknown tool: ${name}`);
+      known ? `tool "${name}" is not available in read-only mode` : `unknown tool: ${name} (see /api/tools/list)`);
   }
   let args;
   try {
@@ -926,6 +947,15 @@ function handleCall(url, res) {
   } catch {
     return fail(res, 400, 'BAD_ARGS', 'args is not a valid JSON object');
   }
+  // Compatibility: some client frameworks flatten parameters into individual
+  // query params (?tool=read_file&path=x&limit=50) instead of the args JSON
+  // object. Merge them in; the args JSON wins on key conflicts.
+  const flat = {};
+  for (const [k, v] of url.searchParams) {
+    if (k === 'tool' || k === 'args') continue;
+    flat[k] = coerceFlatValue(v);
+  }
+  args = { ...flat, ...args };
   let result;
   try {
     result = tool.fn(args);
