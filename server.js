@@ -33,12 +33,13 @@ function printHelp() {
   console.log(`muse-ai-local-bridge server (V1)
 
 Usage: server.js [options]
+       server.js add <folder> | remove <name-or-path> | list
 
   --port N          listen port (default 8787)
-  --read-only       read-only mode ("baca"): write tools and run_command
-                    are not listed and cannot be called
+  --read-only       read-only mode: write tools and run_command
+                    are not listed and cannot be called.
   --allow "cmd"     add a command pattern to the run_command allowlist
-                    (repeatable; not used yet in stage 2a)
+                    (repeatable; exact match, no shell metacharacters)
   --token-file p    persist the API token in file p (mode 0600) instead of
                     generating a fresh one on every start
   -h, --help        this text
@@ -84,9 +85,100 @@ function parseArgs(argv) {
 // Startup: scope guard + token
 // ---------------------------------------------------------------------------
 
-const opts = parseArgs(process.argv);
-
 const CONFIG_PATH = path.join(os.homedir(), '.muse-ai-local-bridge', 'config.json');
+
+// ---------------------------------------------------------------------------
+// Project management subcommands — no hand-editing JSON needed:
+//
+//   muse-ai-local-bridge add <folder>       add a project root
+//   muse-ai-local-bridge remove <name|path> remove a project root
+//   muse-ai-local-bridge list               show registered roots
+//
+// They only edit the config file; a running server picks it up via hot-reload.
+// ---------------------------------------------------------------------------
+
+function readConfigFile() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    if (cfg && Array.isArray(cfg.roots)) return cfg;
+  } catch { /* missing or broken: start fresh */ }
+  return { roots: [] };
+}
+
+function writeConfigFile(cfg) {
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+}
+
+/** Same guards as server roots: must exist, be a directory, not home/drive root. */
+function validateRootDir(p) {
+  let real;
+  try { real = fs.realpathSync(p); }
+  catch { return { error: `not found: ${p}` }; }
+  try {
+    if (!fs.statSync(real).isDirectory()) return { error: `not a directory: ${p}` };
+  } catch { return { error: `not found: ${p}` }; }
+  const parsed = path.parse(real);
+  if (real === parsed.root || real === fs.realpathSync(os.homedir())) {
+    return { error: `too broad, refusing: ${p}` };
+  }
+  return { name: path.basename(real), path: real };
+}
+
+function cmdAdd(target) {
+  if (!target) { console.error('usage: muse-ai-local-bridge add <folder>'); process.exit(2); }
+  const v = validateRootDir(target);
+  if (v.error) { console.error(`error: ${v.error}`); process.exit(1); }
+  const cfg = readConfigFile();
+  const dup = cfg.roots.some(e => {
+    try { return fs.realpathSync(typeof e === 'string' ? e : e.path) === v.path; }
+    catch { return false; }
+  });
+  if (dup) { console.log(`already registered: ${v.path}`); return; }
+  cfg.roots.push(v.path);
+  writeConfigFile(cfg);
+  console.log(`added: ${v.path}`);
+  console.log('A running server picks it up automatically — no restart needed.');
+}
+
+function cmdRemove(target) {
+  if (!target) { console.error('usage: muse-ai-local-bridge remove <name-or-path>'); process.exit(2); }
+  const cfg = readConfigFile();
+  let real = null;
+  try { real = fs.realpathSync(target); } catch { /* match by name then */ }
+  const s = target.toLowerCase();
+  const before = cfg.roots.length;
+  cfg.roots = cfg.roots.filter(e => {
+    const ep = typeof e === 'string' ? e : e.path;
+    const nm = (typeof e === 'object' && e.name) || path.basename(ep);
+    if (real) { try { if (fs.realpathSync(ep) === real) return false; } catch { /* keep */ } }
+    return nm.toLowerCase() !== s;
+  });
+  if (cfg.roots.length === before) { console.error(`error: no such project: ${target}`); process.exit(1); }
+  writeConfigFile(cfg);
+  console.log(`removed: ${target}`);
+}
+
+function cmdList() {
+  const cfg = readConfigFile();
+  if (cfg.roots.length === 0) { console.log('no projects registered.'); return; }
+  cfg.roots.forEach((e, i) => {
+    const ep = typeof e === 'string' ? e : e.path;
+    const nm = (typeof e === 'object' && e.name) || path.basename(ep);
+    console.log(`${i === 0 ? '*' : ' '} ${nm}  ${ep}`);
+  });
+  console.log('\n* = default project');
+}
+
+const subcommand = process.argv[2];
+if (subcommand === 'add' || subcommand === 'remove' || subcommand === 'list') {
+  if (subcommand === 'add') cmdAdd(process.argv[3]);
+  else if (subcommand === 'remove') cmdRemove(process.argv[3]);
+  else cmdList();
+  process.exit(0);
+}
+
+const opts = parseArgs(process.argv);
 
 /**
  * Explicit multi-root config. Returns [{name, path}] or null when absent.
@@ -122,31 +214,50 @@ function loadRoots() {
   return roots;
 }
 
-const CONFIG_ROOTS = loadRoots();
-let ROOTS;
-if (CONFIG_ROOTS) {
-  ROOTS = CONFIG_ROOTS; // explicit scope: cwd is irrelevant in config mode
-} else {
-  const cwd = fs.realpathSync(process.cwd());
-  const parsed = path.parse(cwd);
-  const home = fs.realpathSync(os.homedir());
-  if (cwd === parsed.root || cwd === home) {
-    console.error(
-      'Refusing to start: the working directory is a drive root or your home\n' +
-      'directory, which is too broad a scope. cd into your project folder first.'
-    );
-    process.exit(2);
+const START_CWD = fs.realpathSync(process.cwd());
+
+/**
+ * Hot-reloadable roots. The config file is re-read whenever its mtime
+ * changes, so adding a project never needs a server restart. Invalid edits
+ * keep the previous roots (with a warning) instead of breaking the server.
+ */
+let rootsCache = { mtime: -1, roots: null };
+
+function getRoots() {
+  let mtime = 0;
+  try { mtime = fs.statSync(CONFIG_PATH).mtimeMs; } catch { /* no config file */ }
+  if (rootsCache.roots === null || mtime !== rootsCache.mtime) {
+    const fromConfig = loadRoots();
+    let roots;
+    if (fromConfig) {
+      roots = fromConfig; // explicit scope: cwd is irrelevant in config mode
+    } else {
+      const parsed = path.parse(START_CWD);
+      const home = fs.realpathSync(os.homedir());
+      if (START_CWD === parsed.root || START_CWD === home) {
+        console.error(
+          'Refusing to start: the working directory is a drive root or your home\n' +
+          'directory, which is too broad a scope. cd into your project folder first.'
+        );
+        process.exit(2);
+      }
+      roots = [{ name: path.basename(START_CWD), path: START_CWD }];
+    }
+    rootsCache = { mtime, roots };
   }
-  ROOTS = [{ name: path.basename(cwd), path: cwd }];
+  return rootsCache.roots;
 }
-const DEFAULT_ROOT = ROOTS[0];
+
+// Resolve once at startup so a bad launch fails fast instead of serving nothing.
+getRoots();
 
 /** Pick the root for a call: args.project (name or path), else the default. */
 function selectRoot(args) {
+  const roots = getRoots();
   const sel = args.project;
-  if (sel === undefined || sel === null || sel === '') return { root: DEFAULT_ROOT };
+  if (sel === undefined || sel === null || sel === '') return { root: roots[0] };
   const s = String(sel).toLowerCase();
-  const found = ROOTS.find(r => r.name.toLowerCase() === s || r.path.toLowerCase() === s);
+  const found = roots.find(r => r.name.toLowerCase() === s || r.path.toLowerCase() === s);
   if (!found) return { error: 'BAD_ARGS', message: `unknown project: ${sel} (see list_projects)` };
   return { root: found };
 }
@@ -166,11 +277,22 @@ function loadToken(tokenFile) {
 const TOKEN = loadToken(opts.tokenFile);
 const TOKEN_BUF = Buffer.from(TOKEN, 'utf8');
 
-function authorized(req) {
-  const got = req.headers['x-api-key'];
-  if (typeof got !== 'string' || !got) return false;
-  const buf = Buffer.from(got, 'utf8');
+function tokenMatches(provided) {
+  if (typeof provided !== 'string' || !provided) return false;
+  const buf = Buffer.from(provided, 'utf8');
   return buf.length === TOKEN_BUF.length && crypto.timingSafeEqual(buf, TOKEN_BUF);
+}
+
+function authorized(req) {
+  // Canonical: X-Api-Key. Fallback: Authorization: Bearer — many client
+  // frameworks default to it, and guessing wrong costs the owner an
+  // explanation round-trip. Same token, same secrecy, no weaker.
+  if (tokenMatches(req.headers['x-api-key'])) return true;
+  const authz = req.headers['authorization'];
+  if (typeof authz === 'string' && authz.startsWith('Bearer ')) {
+    return tokenMatches(authz.slice(7));
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +395,8 @@ function isBinary(buf) {
 // ---------------------------------------------------------------------------
 
 function tool_list_projects() {
-  return { projects: ROOTS.map(r => ({ name: r.name, path: r.path, is_default: r === DEFAULT_ROOT })) };
+  const roots = getRoots();
+  return { projects: roots.map((r, i) => ({ name: r.name, path: r.path, is_default: i === 0 })) };
 }
 
 function tool_list_files(args) {
@@ -505,7 +628,7 @@ function atomicWrite(absPath, content) {
 }
 
 // ---------------------------------------------------------------------------
-// Write tools (PROTOCOL.md section 6) — kerja mode only
+// Write tools (PROTOCOL.md section 6) — read-write mode only
 // ---------------------------------------------------------------------------
 
 const MAX_WRITE_BYTES = 1024 * 1024; // 1 MB
@@ -748,8 +871,8 @@ const READ_TOOLS = {
   },
 };
 
-// Write tools and run_command are only registered in kerja mode
-// (see ALL_TOOLS below); in baca mode they are not listed and not callable.
+// Write tools and run_command are only registered in read-write mode
+// (see ALL_TOOLS below); in read-only mode they are not listed and not callable.
 const WRITE_TOOLS = {
   write_file: {
     fn: tool_write_file,
@@ -776,8 +899,8 @@ const ALL_TOOLS = opts.readOnly ? READ_TOOLS : { ...READ_TOOLS, ...WRITE_TOOLS }
 
 function serveToolsList(res) {
   ok(res, {
-    mode: opts.readOnly ? 'baca' : 'kerja',
-    project_roots: ROOTS.map(r => r.path),
+    mode: opts.readOnly ? 'read-only' : 'read-write',
+    project_roots: getRoots().map(r => r.path),
     tools: Object.entries(ALL_TOOLS).map(([name, t]) => ({
       name,
       description: t.description,
@@ -833,7 +956,7 @@ Auth: X-Api-Key header on every request (token from the secure connection card).
 
 Discipline:
 - Read tools are free to use.
-- Write tools / run_command (kerja mode): ALWAYS obtain explicit owner approval
+- Write tools / run_command (read-write mode): ALWAYS obtain explicit owner approval
   in chat first, showing the exact path/command and what will change.
 - Never write secrets into files. Never attempt path traversal.
 `;
@@ -870,7 +993,13 @@ const server = http.createServer((req, res) => {
       'text/plain; charset=utf-8');
   }
   if (url.pathname === '/skill.md') return serveSkill(res);
-  if (!authorized(req)) return fail(res, 401, 'INVALID_TOKEN', 'missing or invalid token');
+  if (!authorized(req)) {
+    // Self-describing: a client that guessed the wrong transport (e.g. a
+    // connector defaulting to Authorization: Bearer) learns the right one
+    // here instead of asking the owner.
+    return fail(res, 401, 'INVALID_TOKEN',
+      'missing or invalid token — send it in the X-Api-Key header (Authorization: Bearer <token> also accepted)');
+  }
   if (url.pathname === '/api/tools/list') return serveToolsList(res);
   if (url.pathname === '/api/tools/call') return handleCall(url, res);
   return fail(res, 404, 'UNKNOWN_ENDPOINT', `unknown endpoint: ${url.pathname}`);
@@ -881,8 +1010,8 @@ server.listen(opts.port, '127.0.0.1', () => {
   const port = typeof addr === 'object' ? addr.port : opts.port;
   console.log('');
   console.log('muse-ai-local-bridge server running (V1)');
-  console.log(`  roots: ${ROOTS.map(r => r.path).join(', ')}`);
-  console.log(`  mode : ${opts.readOnly ? 'baca (read-only)' : 'kerja (read + write + commands)'}`);
+  console.log(`  roots: ${getRoots().map(r => r.path).join(', ')}`);
+  console.log(`  mode : ${opts.readOnly ? 'read-only' : 'read-write (read + write + commands)'}`);
   console.log(`  local: http://127.0.0.1:${port}`);
   console.log('');
   console.log('  TOKEN (shown once — keep it secret, never paste into chat):');

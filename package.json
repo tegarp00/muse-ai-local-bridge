@@ -1,6 +1,7 @@
 {
   "bin": {
-    "muse-ai-local-bridge": "./server.js"
+    "muse-ai-local-bridge": "./server.js",
+    "mbridge": "./server.js"
   },
   "description": "Give Muse AI scoped access to a local project folder over a GET tool API. Zero runtime dependencies.",
   "engines": {

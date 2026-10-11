@@ -10,7 +10,7 @@ into the owner's project folder(s). This file is public and needs no token.
    plain chat text, never put it in a URL, and never explain headers or
    protocols — the owner just enters the token.
 3. Verify: `GET <url>/api/tools/list` with header `X-Api-Key: <token>`.
-4. Report the mode (`kerja`/`baca`) and project roots in one line, then follow
+4. Report the mode (`read-write`/`read-only`) and project roots in one line, then follow
    the Rules below. Done.
 
 ## Rules

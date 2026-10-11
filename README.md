@@ -14,7 +14,7 @@ Zero runtime dependencies. One file you can audit in ten minutes.
 1. **Install Node.js 18+.** Nothing else.
 2. **Run the server inside your project folder:**
    ```sh
-   cd ~/projects/tokoku
+   cd ~/projects/my-project
    npx github:tegarp00/muse-ai-local-bridge
    ```
    It prints a one-time token. Keep that terminal open.
@@ -40,7 +40,7 @@ Zero runtime dependencies. One file you can audit in ten minutes.
 npx github:tegarp00/muse-ai-local-bridge [options]
 
   --port <n>       listen port (default 8787)
-  --read-only      baca mode: read + git tools only, no writes or commands
+  --read-only      read-only mode: read + git tools only, no writes or commands
   --allow <cmd>    add an exact command to the run_command allowlist
                    (repeatable; patterns with shell metacharacters are refused)
   --token-file <p> write the one-time token to a file (for scripting)
@@ -71,12 +71,26 @@ Stuck? [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 Create `~/.muse-ai-local-bridge/config.json`:
 
 ```json
-{ "roots": ["/home/you/projects/tokoku", { "name": "blog", "path": "/home/you/projects/blog" }] }
+{ "roots": ["/home/you/projects/my-project", { "name": "blog", "path": "/home/you/projects/blog" }] }
 ```
 
 One server then serves every root; each tool takes an optional `project`
 (name or path) argument. See [config.example.json](config.example.json).
 Without a config file, the server scopes itself to the folder you ran it in.
+
+The config is re-read whenever the file changes — add or remove a project and
+it takes effect on the next call, no restart needed.
+
+Don't want to hand-edit JSON? Manage projects from the terminal
+(`mbridge` is a short alias for `muse-ai-local-bridge`):
+
+```sh
+mbridge add ~/projects/my-project   # add a project
+mbridge remove my-project           # remove by name or path
+mbridge list                        # show registered projects
+```
+
+(With npx: `npx github:tegarp00/muse-ai-local-bridge add ~/projects/my-project`.)
 
 ## Revoking access
 

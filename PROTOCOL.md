@@ -39,6 +39,9 @@ This is deliberate, not legacy:
 
 - The client MUST send the token in the `X-Api-Key` header on every
   authenticated request.
+- Fallback: the server also accepts `Authorization: Bearer <token>`, because
+  many client frameworks default to it. Same token, same secrecy — this only
+  avoids a failed-guess round-trip. `X-Api-Key` remains canonical.
 - Exception (bootstrap): `GET /` and `GET /skill.md` are public and need no
   token, so a fresh client can learn how to connect from the URL alone.
   They carry no secrets.
@@ -73,8 +76,8 @@ Response data:
 {
   "ok": true,
   "data": {
-    "mode": "kerja",
-    "project_roots": ["/home/user/projects/tokoku"],
+    "mode": "read-write",
+    "project_roots": ["/home/user/projects/my-project"],
     "tools": [
       {
         "name": "read_file",
@@ -88,7 +91,7 @@ Response data:
 }
 ```
 
-In `baca` (read-only) mode, write tools and `run_command` are omitted
+In `read-only` mode, write tools and `run_command` are omitted
 from the list.
 
 ### 3.3 `GET /api/tools/call`
@@ -154,7 +157,7 @@ Tool names are **frozen** as of V1 — clients depend on them.
 | `git_diff` | `project` (optional), `staged` (bool) | Unified diff. |
 | `git_log` | `project` (optional), `limit` (default 20) | |
 
-### Write tools (`kerja` mode only)
+### Write tools (`read-write` mode only)
 
 | Tool | Args | Notes |
 |---|---|---|
@@ -162,7 +165,7 @@ Tool names are **frozen** as of V1 — clients depend on them.
 | `edit_file` | `path`, `old_text`, `new_text` | Exact match on `old_text`, written **literally** (no unicode-escape interpretation). One match required; zero or many matches is an error, never a silent partial write. Sequential application only. |
 | `apply_patch` | `path`, `patch` (unified diff) | Atomic; applied with fuzz factor 0. |
 
-### Command tool (`kerja` mode only)
+### Command tool (`read-write` mode only)
 
 `run_command`: `command` (string), `project` (optional), `timeout_s`
 (optional, default 600).

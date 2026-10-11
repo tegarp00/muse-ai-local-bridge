@@ -11,6 +11,12 @@ Cloudflare can't reach the origin. Almost always one of these:
 
 Fix the cause, wait ~30 seconds, retry. The bridge server itself is probably fine.
 
+**Flapping between working and 1033?** Check the `cloudflared` log for
+`QUIC connection failed` / `proceed using 'http2'`. That means your network
+blocks outbound UDP, so the tunnel runs on degraded transport and reconnects
+more often. Allow outbound UDP on port 7844 if you can; otherwise keep the
+laptop awake and expect occasional hiccups.
+
 ## `502 Bad Gateway` — tunnel is up, bridge isn't
 
 The tunnel reaches your machine but nothing answers on the port. Check:
@@ -27,8 +33,8 @@ restarted the server, the old token is dead. Copy the new one from the terminal
 
 ## `403` on a write or command
 
-You're in **baca mode** (`--read-only`): only read and git tools are available.
-Restart without the flag for kerja mode.
+You're in **read-only mode** (`--read-only`): only read and git tools are available.
+Restart without the flag for read-write mode.
 
 ## The tunnel URL changed — or Cloudflare starts blocking you
 

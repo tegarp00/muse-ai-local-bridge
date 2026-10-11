@@ -1,6 +1,6 @@
 {
   "roots": [
-    "/home/you/projects/tokoku",
+    "/home/you/projects/my-project",
     {
       "name": "blog",
       "path": "/home/you/projects/blog"
