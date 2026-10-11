@@ -1032,7 +1032,16 @@ const server = http.createServer((req, res) => {
   }
   if (url.pathname === '/api/tools/list') return serveToolsList(res);
   if (url.pathname === '/api/tools/call') return handleCall(url, res);
-  return fail(res, 404, 'UNKNOWN_ENDPOINT', `unknown endpoint: ${url.pathname}`);
+  // REST-style guess: some clients call /tools/<name>, /api/tools/<name>,
+  // /v1/tools/<name> or /api/v1/tools/<name> instead of /api/tools/call.
+  // Accept the shape; the query params are merged as args by handleCall.
+  const restTool = url.pathname.match(/^\/(?:api\/)?(?:v1\/)?tools\/([a-z_]+)$/);
+  if (restTool) {
+    url.searchParams.set('tool', restTool[1]);
+    return handleCall(url, res);
+  }
+  return fail(res, 404, 'UNKNOWN_ENDPOINT',
+    `unknown endpoint: ${url.pathname} (tools live at GET /api/tools/call?tool=<name>&... — see /skill.md)`);
 });
 
 server.listen(opts.port, '127.0.0.1', () => {
