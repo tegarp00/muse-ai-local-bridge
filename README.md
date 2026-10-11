@@ -18,11 +18,13 @@ Zero runtime dependencies. One file you can audit in ten minutes.
    npx github:tegarp00/muse-ai-local-bridge
    ```
    It prints a one-time token. Keep that terminal open.
-3. **Expose it** with a tunnel you control, e.g.:
+3. **Expose it** with a tunnel you control. Any tunnel works — cloudflared,
+   ngrok, Tailscale, … — e.g.:
    ```sh
    cloudflared tunnel --url http://localhost:8787
    ```
-   Note the public URL it gives you.
+   Note the public URL it gives you. (Quick tunnels are fine for trying;
+   for daily use set up a named tunnel — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).)
 4. **In chat, paste:**
    > connect to my local bridge at https://your-tunnel-url
 5. The assistant asks for the token through a secure card (never paste the token

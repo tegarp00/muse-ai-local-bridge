@@ -30,11 +30,28 @@ restarted the server, the old token is dead. Copy the new one from the terminal
 You're in **baca mode** (`--read-only`): only read and git tools are available.
 Restart without the flag for kerja mode.
 
-## The tunnel URL changed
+## The tunnel URL changed — or Cloudflare starts blocking you
 
 Quick tunnels (e.g. `*.trycloudflare.com`) get a new URL on every restart.
-Reconnect in chat with the new URL. For a stable address, use a
-**named tunnel** instead.
+Worse: creating them over and over can get you throttled or blocked —
+quick tunnels are meant for short tests, not daily use. If your tunnel
+suddenly stops connecting after working fine, this is likely why.
+
+Use a **named tunnel** instead (free, one-time setup with a Cloudflare account):
+stable URL, no rotation, no block.
+
+```sh
+cloudflared tunnel login
+cloudflared tunnel create mybridge
+cloudflared tunnel route dns mybridge bridge.yourdomain.com
+cloudflared tunnel run --url http://localhost:8787 mybridge
+```
+
+Then connect in chat with the stable `https://bridge.yourdomain.com` once,
+and never again.
+
+Using ngrok instead? Its free URLs also rotate on every restart — set a
+static domain for daily use, same idea.
 
 ## Calls fail or hang on large payloads
 
