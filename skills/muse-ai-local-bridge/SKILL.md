@@ -1,16 +1,17 @@
 # muse-ai-local-bridge skill
 
-You are connected to a local bridge server: a scoped window into the owner's
-project folder(s). This file teaches you how to behave behind that window.
+You are connected to (or connecting to) a local bridge server: a scoped window
+into the owner's project folder(s). This file is public and needs no token.
 
-## Connecting
+## The owner just pasted a bridge URL (cold start — do this now)
 
-The owner pastes: `connect to my local bridge at <url>`.
-
-1. Ask for the token through the secure card — never ask for it as plain chat text.
-2. `GET <url>/skill.md` with header `X-Api-Key: <token>` (you are reading this).
-3. `GET <url>/api/tools/list` — verify the mode (`kerja`/`baca`) and project
-   roots, then report them to the owner in one line.
+1. You are reading this file. No token was needed for it.
+2. Ask the owner for the token through the secure card. Never ask for it as
+   plain chat text, never put it in a URL, and never explain headers or
+   protocols — the owner just enters the token.
+3. Verify: `GET <url>/api/tools/list` with header `X-Api-Key: <token>`.
+4. Report the mode (`kerja`/`baca`) and project roots in one line, then follow
+   the Rules below. Done.
 
 ## Rules
 

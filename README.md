@@ -27,9 +27,10 @@ Zero runtime dependencies. One file you can audit in ten minutes.
    for daily use set up a named tunnel — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).)
 4. **In chat, paste:**
    > connect to my local bridge at https://your-tunnel-url
-5. The assistant asks for the token through a secure card (never paste the token
-   as plain chat text), verifies with `GET /api/tools/list`, and reports the mode
-   and project roots it can see.
+5. The assistant reads the skill from your URL, asks for the token through a
+   secure card (never paste the token as plain chat text), verifies, and
+   reports the mode and project roots it can see. You only paste the sentence
+   and enter the token — no explaining needed.
 6. **Done.** Ask it to read, search, edit, or run your build. Writes and commands
    always ask for your approval first.
 

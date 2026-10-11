@@ -32,6 +32,9 @@ doesn't. Read it before exposing a server.
   write or run something, it is the *assistant's* job to ask your approval first.
   This server cannot tell whether the assistant asked. A client that skips
   approvals can write and run anything the allowlist permits.
+- **`/` and `/skill.md` are public by design.** A fresh assistant must learn how
+  to connect from the URL alone, so these two routes need no token. They carry
+  no secrets — only connection instructions. Everything else requires the token.
 - **Your tunnel is your perimeter.** Anyone holding your tunnel URL *and* the
   token has the same access you have in chat. Use a tunnel you trust, keep the
   URL private, and rotate the token by restarting the server (it's fresh every run).

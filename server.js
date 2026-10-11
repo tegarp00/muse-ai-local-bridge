@@ -856,8 +856,21 @@ const server = http.createServer((req, res) => {
     return fail(res, 400, 'BAD_ARGS', 'malformed URL');
   }
   if (req.method !== 'GET') return fail(res, 405, 'METHOD_NOT_ALLOWED', 'only GET is supported');
-  if (!authorized(req)) return fail(res, 401, 'INVALID_TOKEN', 'missing or invalid token');
+  // Public bootstrap: an assistant that has never seen a bridge must learn
+  // how to connect from the URL alone — no token, no explaining. These two
+  // routes carry no secrets; everything else stays behind the token.
+  if (url.pathname === '/' || url.pathname === '/index.html') {
+    return send(res, 200,
+      'muse-ai-local-bridge\n\n' +
+      'This is a local bridge server. To connect as an AI assistant:\n' +
+      '1. Read /skill.md (no token needed).\n' +
+      '2. Ask the owner for the token via secure input — never as chat text.\n' +
+      '3. Send it as the X-Api-Key header on /api/tools/*.\n\n' +
+      'Humans: https://github.com/tegarp00/muse-ai-local-bridge\n',
+      'text/plain; charset=utf-8');
+  }
   if (url.pathname === '/skill.md') return serveSkill(res);
+  if (!authorized(req)) return fail(res, 401, 'INVALID_TOKEN', 'missing or invalid token');
   if (url.pathname === '/api/tools/list') return serveToolsList(res);
   if (url.pathname === '/api/tools/call') return handleCall(url, res);
   return fail(res, 404, 'UNKNOWN_ENDPOINT', `unknown endpoint: ${url.pathname}`);
@@ -877,7 +890,7 @@ server.listen(opts.port, '127.0.0.1', () => {
   console.log('');
   console.log('  Next steps:');
   console.log(`  1. Publish localhost with your tunnel, e.g.: cloudflared tunnel --url http://127.0.0.1:${port}`);
-  console.log('  2. In Muse chat, paste:  connect bridge: <your-tunnel-url>');
+  console.log('  2. In chat, paste:  connect to my local bridge at <your-tunnel-url>');
   console.log('  3. Enter the token above in the connection card when asked.');
   console.log('');
 });
