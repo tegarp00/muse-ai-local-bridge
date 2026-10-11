@@ -1,0 +1,9 @@
+{
+  "roots": [
+    "/home/you/projects/tokoku",
+    {
+      "name": "blog",
+      "path": "/home/you/projects/blog"
+    }
+  ]
+}
