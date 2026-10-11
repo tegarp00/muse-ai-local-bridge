@@ -27,6 +27,13 @@ This is deliberate, not legacy:
   localhost only; the tunnel is the sole ingress.
 - All requests are HTTP GET. There is no request body.
 - All endpoints require authentication (Section 2), no exceptions.
+- **Practical payload limit:** tool arguments travel in the URL query
+  string, so very large calls can be dropped by intermediaries. Observed
+  in practice: a 22 KB `write_file` call had its connection closed without
+  response, while a 7.3 KB call succeeded. Clients SHOULD keep a single call
+  under ~7 KB and split large writes into sequential chunks (e.g.
+  `write_file` the first chunk, then `edit_file` appends). Servers MUST NOT
+  silently truncate arguments — oversized input should fail loudly.
 
 ## 2. Authentication
 
