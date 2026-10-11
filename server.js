@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * muse-ai-local-bridge — server (V1, stage 2a: scaffold + read tools)
+ * muse-ai-local-bridge — server (V1)
  *
  * Gives an AI client (e.g. Muse at muse.ai) scoped read access to the
  * folder this command runs in, over a GET-based tool API (see PROTOCOL.md).
@@ -406,6 +406,225 @@ function tool_git_log(args) {
 }
 
 // ---------------------------------------------------------------------------
+// Audit log — append-only record of every write and command (PROTOCOL.md 8)
+// ---------------------------------------------------------------------------
+
+function auditLog(tool, target, result) {
+  try {
+    const dir = path.join(os.homedir(), '.muse-ai-local-bridge');
+    fs.mkdirSync(dir, { recursive: true });
+    const line = `${new Date().toISOString()}\t${tool}\t${target}\t${result}\n`;
+    fs.appendFileSync(path.join(dir, 'audit.log'), line);
+  } catch {
+    // Audit must never break the tool it records.
+  }
+}
+
+/** Atomic write: temp file in the same directory, then rename. */
+function atomicWrite(absPath, content) {
+  const dir = path.dirname(absPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.${path.basename(absPath)}.tmp-${crypto.randomBytes(8).toString('hex')}`);
+  fs.writeFileSync(tmp, content, 'utf8');
+  fs.renameSync(tmp, absPath);
+}
+
+// ---------------------------------------------------------------------------
+// Write tools (PROTOCOL.md section 6) — kerja mode only
+// ---------------------------------------------------------------------------
+
+const MAX_WRITE_BYTES = 1024 * 1024; // 1 MB
+
+function tool_write_file(args) {
+  if (!args.path || typeof args.path !== 'string') return { error: 'BAD_ARGS', message: 'path is required' };
+  if (typeof args.content !== 'string') return { error: 'BAD_ARGS', message: 'content must be a string' };
+  if (Buffer.byteLength(args.content, 'utf8') > MAX_WRITE_BYTES) {
+    return { error: 'BAD_ARGS', message: `content too large (max ${MAX_WRITE_BYTES} bytes)` };
+  }
+  const r = resolveInRoot(args.path);
+  if (r.error && r.error !== 'PATH_NOT_FOUND') return { error: r.error, message: r.message };
+  // resolveInRoot fails on missing paths; for writes, resolve the parent instead.
+  let abs;
+  if (r.error === 'PATH_NOT_FOUND') {
+    const parent = resolveInRoot(path.dirname(args.path) === '.' ? '.' : path.dirname(args.path));
+    if (parent.error) return { error: parent.error, message: parent.message };
+    abs = path.join(parent.path, path.basename(args.path));
+    const rel = path.relative(ROOT, abs);
+    if (rel === '..' || rel.startsWith('..' + path.sep)) return { error: 'PATH_OUTSIDE_ROOT', message: 'path is outside the allowed root' };
+  } else {
+    abs = r.path;
+  }
+  if (isBlocked(abs)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  try {
+    if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
+      return { error: 'BAD_ARGS', message: 'path is a directory' };
+    }
+    atomicWrite(abs, args.content);
+  } catch (e) {
+    return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` };
+  }
+  auditLog('write_file', path.relative(ROOT, abs).split(path.sep).join('/'), 'ok');
+  return { path: path.relative(ROOT, abs).split(path.sep).join('/'), bytes_written: Buffer.byteLength(args.content, 'utf8') };
+}
+
+function tool_edit_file(args) {
+  for (const k of ['path', 'old_text', 'new_text']) {
+    if (typeof args[k] !== 'string') return { error: 'BAD_ARGS', message: `${k} is required and must be a string` };
+  }
+  const r = resolveInRoot(args.path);
+  if (r.error) return { error: r.error, message: r.message };
+  if (isBlocked(r.path)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  let content;
+  try { content = fs.readFileSync(r.path, 'utf8'); }
+  catch { return { error: 'PATH_NOT_FOUND', message: 'no such file or directory' }; }
+  // Literal match — never regex. Exactly one occurrence, or refuse.
+  const first = content.indexOf(args.old_text);
+  if (first === -1) return { error: 'BAD_ARGS', message: 'old_text not found' };
+  if (content.indexOf(args.old_text, first + 1) !== -1) {
+    return { error: 'BAD_ARGS', message: 'old_text matches more than once; make it unique' };
+  }
+  const next = content.slice(0, first) + args.new_text + content.slice(first + args.old_text.length);
+  if (Buffer.byteLength(next, 'utf8') > MAX_WRITE_BYTES) {
+    return { error: 'BAD_ARGS', message: `result too large (max ${MAX_WRITE_BYTES} bytes)` };
+  }
+  try { atomicWrite(r.path, next); }
+  catch (e) { return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` }; }
+  auditLog('edit_file', path.relative(ROOT, r.path).split(path.sep).join('/'), 'ok');
+  return { path: path.relative(ROOT, r.path).split(path.sep).join('/'), bytes_written: Buffer.byteLength(next, 'utf8') };
+}
+
+function tool_apply_patch(args) {
+  if (typeof args.path !== 'string' || typeof args.patch !== 'string') {
+    return { error: 'BAD_ARGS', message: 'path and patch are required strings' };
+  }
+  const r = resolveInRoot(args.path);
+  if (r.error) return { error: r.error, message: r.message };
+  if (isBlocked(r.path)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+  let lines;
+  try { lines = fs.readFileSync(r.path, 'utf8').split('\n'); }
+  catch { return { error: 'PATH_NOT_FOUND', message: 'no such file or directory' }; }
+
+  // Parse hunks. Fuzz factor 0: every hunk must match at its exact position.
+  // Body length is driven by the header counts (an empty line = empty
+  // context line), so a trailing newline never becomes a phantom hunk line.
+  const hunks = [];
+  const patchLines = args.patch.split('\n');
+  let i = 0;
+  while (i < patchLines.length) {
+    const m = patchLines[i].match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (!m) { i++; continue; }
+    const oldStart = parseInt(m[1], 10);
+    let needOld = m[2] !== undefined ? parseInt(m[2], 10) : 1;
+    let needNew = m[4] !== undefined ? parseInt(m[4], 10) : 1;
+    i++;
+    const oldLines = [], newLines = [];
+    while (i < patchLines.length && (needOld > 0 || needNew > 0)) {
+      const pl = patchLines[i];
+      if (pl.startsWith('\\')) { i++; continue; } // "\ No newline at end of file"
+      let tag, body;
+      if (pl === '') { tag = ' '; body = ''; }
+      else { tag = pl[0]; body = pl.slice(1); }
+      if (tag === ' ') {
+        if (needOld === 0 || needNew === 0) {
+          return { error: 'BAD_ARGS', message: 'hunk body does not match header counts' };
+        }
+        oldLines.push(body); newLines.push(body); needOld--; needNew--;
+      } else if (tag === '-') {
+        if (needOld === 0) return { error: 'BAD_ARGS', message: 'hunk body does not match header counts' };
+        oldLines.push(body); needOld--;
+      } else if (tag === '+') {
+        if (needNew === 0) return { error: 'BAD_ARGS', message: 'hunk body does not match header counts' };
+        newLines.push(body); needNew--;
+      } else {
+        return { error: 'BAD_ARGS', message: `malformed patch line: ${pl.slice(0, 40)}` };
+      }
+      i++;
+    }
+    if (needOld !== 0 || needNew !== 0) {
+      return { error: 'BAD_ARGS', message: 'hunk body truncated' };
+    }
+    hunks.push({ oldStart, oldLines, newLines });
+  }
+  if (hunks.length === 0) return { error: 'BAD_ARGS', message: 'no hunks found in patch' };
+
+  // Apply back-to-front so earlier positions stay valid.
+  const out = lines.slice();
+  for (let h = hunks.length - 1; h >= 0; h--) {
+    const { oldStart, oldLines, newLines } = hunks[h];
+    const at = oldStart - 1;
+    for (let k = 0; k < oldLines.length; k++) {
+      if (out[at + k] !== oldLines[k]) {
+        return { error: 'BAD_ARGS', message: `hunk ${hunks.length - h} does not match at line ${oldStart + k} (fuzz 0)` };
+      }
+    }
+    out.splice(at, oldLines.length, ...newLines);
+  }
+  const next = out.join('\n');
+  if (Buffer.byteLength(next, 'utf8') > MAX_WRITE_BYTES) {
+    return { error: 'BAD_ARGS', message: `result too large (max ${MAX_WRITE_BYTES} bytes)` };
+  }
+  try { atomicWrite(r.path, next); }
+  catch (e) { return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` }; }
+  auditLog('apply_patch', path.relative(ROOT, r.path).split(path.sep).join('/'), `${hunks.length} hunks ok`);
+  return { path: path.relative(ROOT, r.path).split(path.sep).join('/'), hunks_applied: hunks.length };
+}
+
+// ---------------------------------------------------------------------------
+// run_command — allowlisted commands only, never a shell (PROTOCOL.md 6)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_ALLOW = ['npm run build', 'npm run typecheck', 'git status', 'git diff', 'git log'];
+// Shell metacharacters: rejected before pattern matching, no exceptions.
+// Rationale: with prefix matching, "git diff" would also allow
+// "git diff --no-index /etc/passwd ..." — so matching is EXACT only.
+const METACHAR = /[;&|$`\n<>*(){}[\]!#~]/;
+
+function validateAllowlist(patterns) {
+  for (const p of patterns) {
+    if (METACHAR.test(p)) {
+      console.error(`Refusing to start: --allow pattern contains shell metacharacters: ${p}`);
+      process.exit(2);
+    }
+  }
+}
+const ALLOWLIST = [...DEFAULT_ALLOW, ...opts.allow];
+validateAllowlist(ALLOWLIST);
+
+function tool_run_command(args) {
+  if (!args.command || typeof args.command !== 'string') {
+    return { error: 'BAD_ARGS', message: 'command is required' };
+  }
+  const cmd = args.command.trim();
+  if (METACHAR.test(cmd)) {
+    auditLog('run_command', cmd.slice(0, 80), 'rejected: metacharacter');
+    return { error: 'COMMAND_REJECTED_METACHAR', message: 'command contains shell metacharacters' };
+  }
+  if (!ALLOWLIST.includes(cmd)) {
+    auditLog('run_command', cmd.slice(0, 80), 'rejected: not allowlisted');
+    return { error: 'COMMAND_NOT_ALLOWED', message: `command not on the allowlist: ${cmd}` };
+  }
+  // Exact match only (see METACHAR rationale above). Split the matched
+  // pattern — which is metacharacter-free by construction — into argv.
+  // No shell is ever involved.
+  const argv = cmd.split(/\s+/);
+  const timeoutMs = Math.min(Math.max((parseInt(args.timeout_s ?? 600, 10) || 600), 1), 1800) * 1000;
+  let r;
+  try {
+    r = spawnSync(argv[0], argv.slice(1), { cwd: ROOT, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+  } catch (e) {
+    auditLog('run_command', cmd, `error: ${e.message}`);
+    return { error: 'INTERNAL_ERROR', message: `command failed to spawn: ${e.message}` };
+  }
+  const output = ((r.stdout || '') + (r.stderr || '')).slice(0, 200000);
+  if (r.error && r.error.code === 'ETIMEDOUT') {
+    auditLog('run_command', cmd, 'timeout');
+    return { error: 'COMMAND_TIMEOUT', message: `timed out after ${timeoutMs / 1000}s`, partial_output: output };
+  }
+  auditLog('run_command', cmd, `exit ${r.status}`);
+  return { command: cmd, exit_code: r.status, output, truncated: output.length >= 200000 };
+}
+
+// ---------------------------------------------------------------------------
 // Tool registry (names frozen per PROTOCOL.md — do not rename)
 // ---------------------------------------------------------------------------
 
@@ -439,8 +658,30 @@ const READ_TOOLS = {
   },
 };
 
-// Stage 2a ships read tools only. Write tools + run_command land in stage 2b.
-const WRITE_TOOLS = {};
+// Write tools and run_command are only registered in kerja mode
+// (see ALL_TOOLS below); in baca mode they are not listed and not callable.
+const WRITE_TOOLS = {
+  write_file: {
+    fn: tool_write_file,
+    description: 'Write a file atomically (temp + rename). Max 1 MB.',
+    parameters: { path: 'string (required)', content: 'string (required)' },
+  },
+  edit_file: {
+    fn: tool_edit_file,
+    description: 'Exact-match string replacement. old_text must match exactly once; written literally.',
+    parameters: { path: 'string (required)', old_text: 'string (required)', new_text: 'string (required)' },
+  },
+  apply_patch: {
+    fn: tool_apply_patch,
+    description: 'Apply a unified diff with fuzz factor 0 (hunks must match at exact positions).',
+    parameters: { path: 'string (required)', patch: 'string (required, unified diff)' },
+  },
+  run_command: {
+    fn: tool_run_command,
+    description: 'Run an allowlisted command without a shell. Exact match only; metacharacters rejected.',
+    parameters: { command: 'string (required)', timeout_s: 'integer 1-1800 (default 600)' },
+  },
+};
 const ALL_TOOLS = opts.readOnly ? READ_TOOLS : { ...READ_TOOLS, ...WRITE_TOOLS };
 
 function serveToolsList(res) {
@@ -536,7 +777,7 @@ server.listen(opts.port, '127.0.0.1', () => {
   const addr = server.address();
   const port = typeof addr === 'object' ? addr.port : opts.port;
   console.log('');
-  console.log('muse-ai-local-bridge server running (V1, stage 2a: read tools)');
+  console.log('muse-ai-local-bridge server running (V1)');
   console.log(`  root : ${ROOT}`);
   console.log(`  mode : ${opts.readOnly ? 'baca (read-only)' : 'kerja (read + write + commands)'}`);
   console.log(`  local: http://127.0.0.1:${port}`);
