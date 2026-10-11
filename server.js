@@ -133,6 +133,14 @@ function cmdAdd(target) {
   const v = validateRootDir(target);
   if (v.error) { console.error(`error: ${v.error}`); process.exit(1); }
   const cfg = readConfigFile();
+  const hadConfig = cfg.roots.length > 0;
+  // First add ever: the server was running in cwd-mode, so keep the current
+  // folder as a root — otherwise the user's current project silently drops
+  // out of the list the moment they add a second one.
+  if (!hadConfig) {
+    const cwdV = validateRootDir(process.cwd());
+    if (!cwdV.error && cwdV.path !== v.path) cfg.roots.push(cwdV.path);
+  }
   const dup = cfg.roots.some(e => {
     try { return fs.realpathSync(typeof e === 'string' ? e : e.path) === v.path; }
     catch { return false; }
@@ -141,6 +149,7 @@ function cmdAdd(target) {
   cfg.roots.push(v.path);
   writeConfigFile(cfg);
   console.log(`added: ${v.path}`);
+  if (!hadConfig && cfg.roots.length > 1) console.log(`kept: ${cfg.roots[0]} (current folder)`);
   console.log('A running server picks it up automatically — no restart needed.');
 }
 
