@@ -669,12 +669,27 @@ function tool_write_file(args) {
   const root = sel.root;
   const r = resolveInRoot(args.path, root);
   if (r.error && r.error !== 'PATH_NOT_FOUND') return { error: r.error, message: r.message };
-  // resolveInRoot fails on missing paths; for writes, resolve the parent instead.
+  // resolveInRoot fails on missing paths; for writes, resolve the nearest
+  // existing ancestor instead and let atomicWrite create the missing folders.
+  // Only the ancestor goes through realpath, so symlink escapes stay rejected;
+  // the segments appended below it are plain names, re-checked in-root below.
   let abs;
   if (r.error === 'PATH_NOT_FOUND') {
-    const parent = resolveInRoot(path.dirname(args.path) === '.' ? '.' : path.dirname(args.path), root);
-    if (parent.error) return { error: parent.error, message: parent.message };
-    abs = path.join(parent.path, path.basename(args.path));
+    const dir = path.dirname(args.path);
+    const parts = dir === '.' ? [] : dir.split(path.sep).filter((s) => s && s !== '.');
+    let ancestor = null;
+    let missing = [];
+    for (let i = parts.length; i >= 0; i--) {
+      const res = resolveInRoot(i === 0 ? '.' : parts.slice(0, i).join(path.sep), root);
+      if (!res.error) {
+        ancestor = res.path;
+        missing = parts.slice(i);
+        break;
+      }
+      if (res.error !== 'PATH_NOT_FOUND') return { error: res.error, message: res.message };
+    }
+    if (!ancestor) return { error: 'PATH_NOT_FOUND', message: `no existing ancestor for: ${args.path}` };
+    abs = path.join(ancestor, ...missing, path.basename(args.path));
     const rel = path.relative(root.path, abs);
     if (rel === '..' || rel.startsWith('..' + path.sep)) return { error: 'PATH_OUTSIDE_ROOT', message: 'path is outside the allowed root' };
   } else {

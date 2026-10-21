@@ -112,10 +112,16 @@ access.
 ## Too lazy to set this up?
 
 This bridge is deliberately DIY: you run the server, you run the tunnel, you
-guard the token. If you'd rather skip all that, [AugentFlow](https://augentflow.com)
-packages the same idea — local project access for Muse AI — as a desktop app
-with the connection, approvals, and audit trail built in. Same people build both;
-this bridge stays MIT-licensed and independent either way.
+guard the token yourself.
+
+If you'd like a more integrated experience, there is [AugentFlow](https://augentflow.com),
+a desktop app by the same people. It provides the MCP server right inside the
+app — though you still run a tunnel so Muse AI can reach your machine — and
+adds approvals before file changes or commands run, a task board, an execution
+queue, and git workflows like commit & push.
+
+Same people build both; this bridge stays MIT-licensed and independent
+either way.
 
 ## Contributing
 

@@ -174,7 +174,7 @@ Tool names are **frozen** as of V1 — clients depend on them.
 
 | Tool | Args | Notes |
 |---|---|---|
-| `write_file` | `path`, `content` | Atomic (temp + rename). Size-capped (default 1 MB). |
+| `write_file` | `path`, `content` | Atomic (temp + rename). Size-capped (default 1 MB). Creates parent folders as needed. |
 | `edit_file` | `path`, `old_text`, `new_text` | Exact match on `old_text`, written **literally** (no unicode-escape interpretation). One match required; zero or many matches is an error, never a silent partial write. Sequential application only. |
 | `apply_patch` | `path`, `patch` (unified diff) | Atomic; applied with fuzz factor 0. |
 
