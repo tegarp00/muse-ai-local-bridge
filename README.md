@@ -21,7 +21,7 @@ Zero runtime dependencies. One file you can audit in ten minutes.
    cd ~/projects/my-project
    mbridge
    ```
-   It prints a one-time token. Keep that terminal open.
+   It prints your access token. Keep that terminal open.
 3. **Expose it** with a tunnel you control. Any tunnel works — cloudflared,
    ngrok, Tailscale, … — e.g.:
    ```sh
@@ -47,11 +47,16 @@ npx muse-ai-local-bridge [options]
   --read-only      read-only mode: read + git tools only, no writes or commands
   --allow <cmd>    add an exact command to the run_command allowlist
                    (repeatable; patterns with shell metacharacters are refused)
-  --token-file <p> write the one-time token to a file (for scripting)
+  --token-file <p> persist the token in file p (mode 0600) instead of the
+                   default ~/.muse-ai-local-bridge/token
+  --new-token      generate a fresh token, replacing the saved one
 ```
 
 The server refuses to start from your home directory or a drive root — `cd` into
-a project first. Every run generates a fresh 256-bit token; nothing is stored.
+a project first. Your 256-bit token is generated once and saved to
+`~/.muse-ai-local-bridge/token` (mode `0600`), then reused on every start —
+so your assistant stays connected without re-entering it. Rotate it anytime
+with `--new-token`.
 
 ## Tools
 
@@ -98,8 +103,11 @@ mbridge list                        # show registered projects
 
 ## Revoking access
 
-Kill the server (`Ctrl+C`). The token dies with the process — nothing is stored,
-nothing survives a restart. Stop the tunnel too, to be thorough.
+Kill the server (`Ctrl+C`) and stop the tunnel. Note that the token itself
+persists across restarts, so killing the server alone does not revoke it. To
+revoke a token for good, rotate it — start once with `--new-token` (or delete
+`~/.muse-ai-local-bridge/token`) — and any client holding the old token loses
+access.
 
 ## Too lazy to set this up?
 

@@ -5,8 +5,13 @@ doesn't. Read it before exposing a server.
 
 ## What the server enforces
 
-- **Authentication on every request.** A 256-bit token is generated per run and
-  compared in constant time. No token, no access — every endpoint, every time.
+- **Authentication on every request.** A 256-bit token — generated once and
+  stored at `~/.muse-ai-local-bridge/token` (mode `0600`) — is compared in
+  constant time. No token, no access — every endpoint, every time.
+  Persistence is deliberate: behind a tunnel (e.g. Cloudflare Zero Trust), a
+  per-run token would force a full reconnect in your assistant after every
+  local restart. The trade-off: a leaked token stays valid until rotated —
+  treat that file like a password.
 - **Localhost only.** The server binds to `127.0.0.1`. The internet can only
   reach it through *your* tunnel.
 - **Scoped root.** The working directory (or each configured root) is the
@@ -37,7 +42,9 @@ doesn't. Read it before exposing a server.
   no secrets — only connection instructions. Everything else requires the token.
 - **Your tunnel is your perimeter.** Anyone holding your tunnel URL *and* the
   token has the same access you have in chat. Use a tunnel you trust, keep the
-  URL private, and rotate the token by restarting the server (it's fresh every run).
+  URL private, and rotate the token with `--new-token` if it may have leaked —
+  a plain restart does not rotate it; the token persists across restarts by
+  design, so your assistant stays connected without re-entering it.
 - **Tool arguments travel in URL query strings.** They can land in tunnel access
   logs. Never send passwords, API keys, or tokens through the tools — put secrets
   into files by hand, on the machine itself.

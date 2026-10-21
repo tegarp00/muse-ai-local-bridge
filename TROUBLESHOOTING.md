@@ -27,9 +27,11 @@ The tunnel reaches your machine but nothing answers on the port. Check:
 
 ## `401 Unauthorized`
 
-The token doesn't match. Tokens are generated fresh on **every run** — if you
-restarted the server, the old token is dead. Copy the new one from the terminal
-(or `--token-file`) and reconnect.
+The token doesn't match. The token persists across restarts, so a restart alone
+never causes this — a mismatch means the client holds a different token than
+the one saved at `~/.muse-ai-local-bridge/token`: it was rotated with
+`--new-token`, the file was deleted, or this server was started with a different
+`--token-file`. Copy the current token from the terminal and reconnect.
 
 ## `403` on a write or command
 
